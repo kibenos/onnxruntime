@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #pragma once
+#include "core/providers/cuda/user_cuda_context.h"
 #include <ctime>
 #ifndef USE_CUDA_MINIMAL
 #include <cudnn.h>
@@ -267,6 +268,9 @@ std::string GetWeightRefittedEnginePath(std::string engine_cache_path);
 
 // Logical device representation.
 class TensorrtExecutionProvider : public IExecutionProvider {
+  // Declared first so the context stays current through member destruction.
+  UserCudaContextScope cleanup_context_;
+
  public:
   explicit TensorrtExecutionProvider(const TensorrtExecutionProviderInfo& info);
   virtual ~TensorrtExecutionProvider();
@@ -439,7 +443,7 @@ class TensorrtExecutionProvider : public IExecutionProvider {
   // For example, TensorRT execution context and CUDA graph are the ones to be put here.
   class PerThreadContext final {
    public:
-    PerThreadContext(OrtDevice::DeviceId device_id, bool has_user_compute_stream, cudaStream_t stream);
+    PerThreadContext(OrtDevice::DeviceId device_id, void* user_cuda_context, bool has_user_compute_stream, cudaStream_t stream);
     ~PerThreadContext();
 
     cublasHandle_t CublasHandle() const {

@@ -2885,10 +2885,11 @@ ORT_API_STATUS_IMPL(OrtApis::UpdateTensorRTProviderOptionsWithValue,
                     _In_ void* value) {
   API_IMPL_BEGIN
 #if defined(USE_TENSORRT) || defined(USE_TENSORRT_PROVIDER_INTERFACE)
-  // current provider option that has pointer data type (excluding const char*) is 'user_compute_stream'
   if (strcmp(key, "user_compute_stream") == 0) {
     tensorrt_options->has_user_compute_stream = 1;
     tensorrt_options->user_compute_stream = value;
+  } else if (strcmp(key, "user_cuda_context") == 0) {
+    tensorrt_options->user_cuda_context = value;
   } else if (strcmp(key, "trt_onnx_bytestream") == 0) {
     tensorrt_options->trt_onnx_bytestream = value;
   } else if (strcmp(key, "trt_onnx_bytestream_size") == 0) {
@@ -2910,9 +2911,10 @@ ORT_API_STATUS_IMPL(OrtApis::GetTensorRTProviderOptionsByName,
                     _Outptr_ void** ptr) {
   API_IMPL_BEGIN
 #if defined(USE_TENSORRT) || defined(USE_TENSORRT_PROVIDER_INTERFACE)
-  // current provider option that has pointer data type (excluding const char*) is 'user_compute_stream'
   if (strcmp(key, "user_compute_stream") == 0) {
     *ptr = tensorrt_options->user_compute_stream;
+  } else if (strcmp(key, "user_cuda_context") == 0) {
+    *ptr = tensorrt_options->user_cuda_context;
   } else {
     *ptr = nullptr;
   }
@@ -3042,6 +3044,8 @@ ORT_API_STATUS_IMPL(OrtApis::UpdateCUDAProviderOptionsWithValue,
   if (strcmp(key, "user_compute_stream") == 0) {
     cuda_options->has_user_compute_stream = 1;
     cuda_options->user_compute_stream = value;
+  } else if (strcmp(key, "user_cuda_context") == 0) {
+    cuda_options->user_cuda_context = value;
   }
   return nullptr;
 #else
@@ -3061,6 +3065,8 @@ ORT_API_STATUS_IMPL(OrtApis::GetCUDAProviderOptionsByName,
 #if defined(USE_CUDA) || defined(USE_CUDA_PROVIDER_INTERFACE)
   if (strcmp(key, "user_compute_stream") == 0) {
     *ptr = cuda_options->user_compute_stream;
+  } else if (strcmp(key, "user_cuda_context") == 0) {
+    *ptr = cuda_options->user_cuda_context;
   } else {
     *ptr = nullptr;
   }

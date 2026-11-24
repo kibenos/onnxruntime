@@ -17,6 +17,7 @@
 #include "core/providers/cuda/shared_inc/cuda_call.h"
 #include "core/providers/cuda/math/unary_elementwise_ops_impl.h"
 #include "core/providers/cuda/gpu_data_transfer.h"
+#include "core/providers/cuda/user_cuda_context_allocator.h"
 #include "core/session/allocator_adapters.h"
 #include "cuda_runtime_api.h"
 #include <gsl/gsl>
@@ -1173,9 +1174,9 @@ Status BindKernelOutput(Ort::KernelContext& ctx,
   return Status::OK();
 }
 
-TensorrtExecutionProvider::PerThreadContext::PerThreadContext(OrtDevice::DeviceId device_id, bool has_user_compute_stream, cudaStream_t stream) {
+TensorrtExecutionProvider::PerThreadContext::PerThreadContext(OrtDevice::DeviceId device_id, void* user_cuda_context, bool has_user_compute_stream, cudaStream_t stream) {
   if (has_user_compute_stream) {
-    CUDA_CALL_THROW(cudaSetDevice(device_id));
+    CUDA_CALL_THROW(SelectProviderCudaDevice(device_id, user_cuda_context));
 #ifndef USE_CUDA_MINIMAL
     ORT_IGNORE_RETURN_VALUE(CUBLAS_CALL(cublasCreate(&external_cublas_handle_)));
     ORT_IGNORE_RETURN_VALUE(CUBLAS_CALL(cublasSetStream(external_cublas_handle_, stream)));
@@ -1295,7 +1296,7 @@ TensorrtExecutionProvider::PerThreadContext& TensorrtExecutionProvider::GetPerTh
     // get or create a context
     if (context_state_.retired_context_pool.empty()) {
       context = std::make_shared<PerThreadContext>(narrow<OrtDevice::DeviceId>(info_.device_id),
-                                                   info_.has_user_compute_stream, stream_);
+                                                   info_.user_cuda_context, info_.has_user_compute_stream, stream_);
     } else {
       context = context_state_.retired_context_pool.back();
       context_state_.retired_context_pool.pop_back();
@@ -1338,7 +1339,8 @@ TensorrtExecutionProvider::TensorrtExecutionProvider(const TensorrtExecutionProv
       device_id_(info.device_id) {
   InitProviderOrtApi();
 
-  CUDA_CALL_THROW(cudaSetDevice(device_id_));
+  CUDA_CALL_THROW(SelectProviderCudaDevice(device_id_, info_.user_cuda_context));
+  CUDA_CALL_THROW(CheckUserCudaStream(info_.user_cuda_context, static_cast<cudaStream_t>(info_.user_compute_stream)));
   cudaDeviceProp prop;
   CUDA_CALL_THROW(cudaGetDeviceProperties(&prop, device_id_));
   compute_capability_ = GetComputeCapacity(prop);
@@ -1861,6 +1863,9 @@ TensorrtExecutionProvider::TensorrtExecutionProvider(const TensorrtExecutionProv
 }
 
 TensorrtExecutionProvider::~TensorrtExecutionProvider() {
+  if (cleanup_context_.Enter(info_.user_cuda_context) != CUDA_SUCCESS) {
+    LOGS_DEFAULT(ERROR) << "Unable to enter user_cuda_context during provider destruction.";
+  }
   // clean up thread local context caches
   {
     std::lock_guard<std::mutex> lock(context_state_.mutex);
@@ -1917,6 +1922,8 @@ bool TensorrtExecutionProvider::IsGraphCaptured(int) const {
 }
 
 Status TensorrtExecutionProvider::ReplayGraph(int, bool /*sync*/) {
+  ORT_RETURN_IF_NOT(CheckUserCudaContext(info_.user_cuda_context, device_id_) == cudaSuccess,
+                    "The calling thread must have user_cuda_context current on the configured device.");
   // The sync parameter is ignored: TRT EP always replays synchronously under a lock_guard in compute_func().
   ORT_ENFORCE(IsGraphCaptured(0));
   // Please note that CUDAGraph::Replay() is not thread safe.
@@ -1934,12 +1941,12 @@ void TensorrtExecutionProvider::IncrementRegularRunCountBeforeGraphCapture() {
 
 std::vector<AllocatorPtr> TensorrtExecutionProvider::CreatePreferredAllocators() {
   AllocatorCreationInfo default_memory_info(
-      [](OrtDevice::DeviceId device_id) { return CreateCUDAAllocator(device_id, onnxruntime::CUDA); },
+      [context = info_.user_cuda_context](OrtDevice::DeviceId device_id) { return WithUserCudaContext(CreateCUDAAllocator(device_id, onnxruntime::CUDA), context); },
       narrow<OrtDevice::DeviceId>(device_id_));
 
   AllocatorCreationInfo pinned_allocator_info(
-      [](OrtDevice::DeviceId device_id) {
-        return CreateCUDAPinnedAllocator(device_id, onnxruntime::CUDA_PINNED);
+      [context = info_.user_cuda_context](OrtDevice::DeviceId device_id) {
+        return WithUserCudaContext(CreateCUDAPinnedAllocator(device_id, onnxruntime::CUDA_PINNED), context);
       },
       narrow<OrtDevice::DeviceId>(device_id_));
 
@@ -1951,6 +1958,8 @@ std::unique_ptr<IDataTransfer> TensorrtExecutionProvider::GetDataTransfer() cons
 }
 
 Status TensorrtExecutionProvider::OnRunStart(const onnxruntime::RunOptions& /*run_options*/) {
+  ORT_RETURN_IF_NOT(CheckUserCudaContext(info_.user_cuda_context, device_id_) == cudaSuccess,
+                    "The calling thread must have user_cuda_context current on the configured device.");
   return Status::OK();
 }
 
@@ -3841,6 +3850,8 @@ Status TensorrtExecutionProvider::CreateNodeComputeInfoFromGraph(const GraphView
 
   // Create compute function
   compute_info.compute_func = [this](FunctionState state, const OrtApi* api, OrtKernelContext* context) {
+    ORT_RETURN_IF_NOT(CheckUserCudaContext(info_.user_cuda_context, device_id_) == cudaSuccess,
+                      "The calling thread must have user_cuda_context current on the configured device.");
     Ort::KernelContext ctx(context);
 
     TensorrtFuncState* trt_state = reinterpret_cast<TensorrtFuncState*>(state);
@@ -4555,6 +4566,8 @@ Status TensorrtExecutionProvider::CreateNodeComputeInfoFromPrecompiledEngine(con
 
   // Create compute function
   compute_info.compute_func = [this](FunctionState state, const OrtApi* api, OrtKernelContext* context) {
+    ORT_RETURN_IF_NOT(CheckUserCudaContext(info_.user_cuda_context, device_id_) == cudaSuccess,
+                      "The calling thread must have user_cuda_context current on the configured device.");
     Ort::KernelContext ctx(context);
 
     TensorrtShortFuncState* trt_state = reinterpret_cast<TensorrtShortFuncState*>(state);
@@ -4776,6 +4789,8 @@ Status TensorrtExecutionProvider::CreateNodeComputeInfoFromPrecompiledEngine(con
 
 void TensorrtExecutionProvider::RegisterStreamHandlers(IStreamCommandHandleRegistry& stream_handle_registry, AllocatorMap& allocators) const {
   auto allocator = allocators[GetOrtDeviceByMemType(OrtMemTypeCPU)];
+  CUDAExecutionProviderInfo stream_info{};
+  stream_info.user_cuda_context = info_.user_cuda_context;
   RegisterCudaStreamHandles(stream_handle_registry,
                             OrtDevice::GPU,
                             allocator,
@@ -4784,7 +4799,7 @@ void TensorrtExecutionProvider::RegisterStreamHandlers(IStreamCommandHandleRegis
                             external_stream_ /* use_existing_stream */,
                             external_cudnn_handle_,
                             external_cublas_handle_,
-                            {});
+                            stream_info);
 }
 
 OrtDevice TensorrtExecutionProvider::GetOrtDeviceByMemType(OrtMemType mem_type) const {

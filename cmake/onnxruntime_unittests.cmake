@@ -2231,7 +2231,7 @@ endif()
       list(APPEND onnxruntime_shared_lib_test_LIBS cpuinfo)
     endif()
     if (onnxruntime_USE_CUDA)
-      list(APPEND onnxruntime_shared_lib_test_LIBS CUDA::cudart)
+      list(APPEND onnxruntime_shared_lib_test_LIBS CUDA::cudart CUDA::cuda_driver)
     endif()
 
     if (onnxruntime_USE_TENSORRT)

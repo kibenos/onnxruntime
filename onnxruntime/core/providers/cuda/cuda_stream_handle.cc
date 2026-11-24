@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 #include "core/providers/cuda/cuda_resource.h"
+#include "core/providers/cuda/user_cuda_context.h"
 #include "core/providers/cuda/cuda_stream_handle.h"
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/cudnn_loader.h"
@@ -32,13 +33,16 @@ DeferredCpuAllocator::DeferredCpuAllocator(CudaStream& cuda_stream) : cuda_strea
 }
 
 struct CudaNotification : public synchronize::Notification {
-  CudaNotification(Stream& s) : Notification(s) {
+  CudaNotification(Stream& s, void* context) : Notification(s), context_(context)
+  {
     CUDA_CALL_THROW(cudaEventCreateWithFlags(&event_, cudaEventDisableTiming));
   }
 
   ~CudaNotification() {
-    if (event_)
+    UserCudaContextScope scope;
+    if (scope.Enter(context_) == CUDA_SUCCESS && event_) {
       CUDA_CALL_THROW(cudaEventDestroy(event_));
+    }
   }
 
   void Activate() override {
@@ -59,6 +63,7 @@ struct CudaNotification : public synchronize::Notification {
   }
 
   cudaEvent_t event_;
+  void* context_;
 };
 
 CudaStream::CudaStream(cudaStream_t stream,
@@ -97,6 +102,11 @@ CudaStream::CudaStream(cudaStream_t stream,
 }
 
 CudaStream::~CudaStream() {
+  UserCudaContextScope scope;
+  if (scope.Enter(ep_info_.user_cuda_context) != CUDA_SUCCESS) {
+    LOGS_DEFAULT(ERROR) << "Unable to enter user_cuda_context during stream destruction.";
+    return;
+  }
   ORT_IGNORE_RETURN_VALUE(CleanUpOnRunEnd());
 #ifndef USE_CUDA_MINIMAL
   if (own_stream_) {
@@ -112,7 +122,7 @@ CudaStream::~CudaStream() {
 }
 
 std::unique_ptr<synchronize::Notification> CudaStream::CreateNotification(size_t /*num_consumers*/) {
-  return std::make_unique<CudaNotification>(*this);
+  return std::make_unique<CudaNotification>(*this, ep_info_.user_cuda_context);
 }
 
 void CudaStream::Flush() {
@@ -265,13 +275,15 @@ void RegisterCudaStreamHandles(IStreamCommandHandleRegistry& stream_handle_regis
   stream_handle_registry.RegisterWaitFn(device_type, OrtDevice::CPU, WaitCudaNotificationOnHost);
   if (!use_existing_stream) {
     stream_handle_registry.RegisterCreateStreamFn(device_type, [cpu_allocator, release_cpu_buffer_on_cuda_stream, ep_info](const OrtDevice& device) {
-      CUDA_CALL_THROW(cudaSetDevice(device.Id()));
+      CUDA_CALL_THROW(SelectProviderCudaDevice(device.Id(), ep_info.user_cuda_context));
       cudaStream_t stream = nullptr;
       CUDA_CALL_THROW(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
       // CUDA_CALL_THROW(cudaStreamCreate(&stream));
       return std::make_unique<CudaStream>(stream, device, cpu_allocator, release_cpu_buffer_on_cuda_stream, true, nullptr, nullptr, ep_info);
     });
-    stream_handle_registry.RegisterSetDeviceFn(device_type, [](OrtDevice::DeviceId id) { CUDA_CALL_THROW(cudaSetDevice(id)); });
+    stream_handle_registry.RegisterSetDeviceFn(device_type, [context = ep_info.user_cuda_context](OrtDevice::DeviceId id) {
+      CUDA_CALL_THROW(SelectProviderCudaDevice(id, context));
+    });
   } else {
     stream_handle_registry.RegisterCreateStreamFn(device_type, [cpu_allocator,
                                                                 release_cpu_buffer_on_cuda_stream,
@@ -279,6 +291,9 @@ void RegisterCudaStreamHandles(IStreamCommandHandleRegistry& stream_handle_regis
                                                                 external_cudnn_handle,
                                                                 external_cublas_handle,
                                                                 ep_info](const OrtDevice& device) {
+      ORT_ENFORCE(CheckUserCudaContext(ep_info.user_cuda_context, device.Id()) == cudaSuccess,
+                  "The calling thread must have user_cuda_context current on the configured device.");
+      CUDA_CALL_THROW(CheckUserCudaStream(ep_info.user_cuda_context, external_stream));
       return std::make_unique<CudaStream>(external_stream, device, cpu_allocator, release_cpu_buffer_on_cuda_stream, false, external_cudnn_handle, external_cublas_handle, ep_info);
     });
   }

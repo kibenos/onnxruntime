@@ -77,6 +77,7 @@ struct Tensorrt_Provider : Provider {
     info.device_id = options.device_id;
     info.has_user_compute_stream = options.has_user_compute_stream != 0;
     info.user_compute_stream = options.user_compute_stream;
+    info.user_cuda_context = options.user_cuda_context;
     info.has_trt_options = true;
     info.max_partition_iterations = options.trt_max_partition_iterations;
     info.min_subgraph_size = options.trt_min_subgraph_size;

@@ -3,6 +3,7 @@
 // Licensed under the MIT License.
 
 #include "core/providers/shared_library/provider_api.h"
+#include "core/providers/cuda/user_cuda_context.h"
 #include "core/providers/cuda/cuda_provider_factory.h"
 #include "core/providers/cuda/cuda_provider_factory_creator.h"
 #include "core/providers/cuda/cuda_provider_options.h"
@@ -211,6 +212,9 @@ struct CUDA_Provider : Provider {
         "external_data_loader_reading_threads must be between 0 and ",
         OrtCUDAProviderOptionsV2::kMaxExternalDataLoaderReadingThreadCount, ".");
 
+    ORT_ENFORCE(CheckUserCudaContext(params->user_cuda_context, params->device_id) == cudaSuccess,
+                "The calling thread must have user_cuda_context current on the configured device.");
+
     // Calling a function like ::cudaDeviceSynchronize will cause CUDA to ensure there is binary code for the current GPU architecture
     // Ideally this will be already part of the binary, but if not, CUDA will JIT it during this call. This can take a very long time
     // (minutes even), so we want to detect when this happens and let the user know why so they can report it properly or even fix it.
@@ -238,6 +242,7 @@ struct CUDA_Provider : Provider {
     info.do_copy_in_default_stream = params->do_copy_in_default_stream != 0;
     info.has_user_compute_stream = params->has_user_compute_stream != 0;
     info.user_compute_stream = params->user_compute_stream;
+    info.user_cuda_context = params->user_cuda_context;
     info.default_memory_arena_cfg = params->default_memory_arena_cfg;
     info.cudnn_conv_use_max_workspace = params->cudnn_conv_use_max_workspace != 0;
     info.enable_cuda_graph = params->enable_cuda_graph != 0;

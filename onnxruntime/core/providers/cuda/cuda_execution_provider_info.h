@@ -54,6 +54,7 @@ struct CUDAExecutionProviderInfo {
   bool do_copy_in_default_stream{true};
   bool has_user_compute_stream{false};
   void* user_compute_stream{nullptr};
+  void* user_cuda_context{nullptr};
   // The following OrtArenaCfg instance only characterizes the behavior of the default memory
   // arena allocator and not any other auxiliary allocator that may also be part of the CUDA EP.
   // For example, auxiliary allocators `CUDA_PINNED` and `CUDA_CPU` will not be configured using this
@@ -125,6 +126,7 @@ struct std::hash<::onnxruntime::CUDAExecutionProviderInfo> {
 
     // Memory pointers
     onnxruntime::HashCombine(reinterpret_cast<size_t>(info.user_compute_stream), value);
+    onnxruntime::HashCombine(reinterpret_cast<size_t>(info.user_cuda_context), value);
     onnxruntime::HashCombine(reinterpret_cast<size_t>(info.external_allocator_info.alloc), value);
     onnxruntime::HashCombine(reinterpret_cast<size_t>(info.external_allocator_info.free), value);
     onnxruntime::HashCombine(reinterpret_cast<size_t>(info.external_allocator_info.empty_cache), value);

@@ -46,6 +46,7 @@
 
 #ifdef USE_CUDA
 #include "core/providers/cuda/cuda_provider_options.h"
+#include <cuda.h>
 #include <cuda_runtime.h>
 #endif
 
@@ -4173,6 +4174,114 @@ INSTANTIATE_TEST_SUITE_P(CApiTensorRTTest, CApiTensorRTTest,
 #endif
 
 #ifdef USE_CUDA
+
+// Run the public Mul model with stable device addresses so the second and later
+// executions can replay a CUDA graph. The application owns both the context and stream.
+static void RunWithUserCudaContext(bool use_tensorrt) {
+  ASSERT_EQ(cuInit(0), CUDA_SUCCESS);
+  CUdevice device{};
+  ASSERT_EQ(cuDeviceGet(&device, 0), CUDA_SUCCESS);
+  CUcontext before{};
+  ASSERT_EQ(cuCtxGetCurrent(&before), CUDA_SUCCESS);
+  CUcontext owner{};
+#if CUDA_VERSION >= 13000
+  ASSERT_EQ(cuCtxCreate(&owner, nullptr, CU_CTX_SCHED_AUTO, device), CUDA_SUCCESS);
+#else
+  ASSERT_EQ(cuCtxCreate(&owner, CU_CTX_SCHED_AUTO, device), CUDA_SUCCESS);
+#endif
+  auto destroy_context = gsl::finally([&] { EXPECT_EQ(cuCtxDestroy(owner), CUDA_SUCCESS); });
+
+  cudaStream_t stream{};
+  ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+  auto destroy_stream = gsl::finally([&] { EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess); });
+
+  {
+    Ort::SessionOptions options;
+    options.SetExecutionMode(ORT_SEQUENTIAL);
+    options.AddConfigEntry(kOrtSessionOptionsDisableCPUEPFallback, "1");
+#ifdef USE_TENSORRT
+    if (use_tensorrt) {
+      Ort::TensorRTProviderOptions provider;
+      provider.Update({{"trt_cuda_graph_enable", "1"}});
+      provider.UpdateWithValue("user_cuda_context", owner);
+      provider.UpdateWithValue("user_compute_stream", stream);
+      EXPECT_EQ(provider.GetOptionByName("user_cuda_context"), owner);
+      options.AppendExecutionProvider_TensorRT_V2(*provider);
+    } else
+#else
+    (void)use_tensorrt;
+#endif
+    {
+      Ort::CUDAProviderOptions provider;
+      provider.Update({{"enable_cuda_graph", "1"}});
+      provider.UpdateWithValue("user_cuda_context", owner);
+      provider.UpdateWithValue("user_compute_stream", stream);
+      EXPECT_EQ(provider.GetOptionByName("user_cuda_context"), owner);
+      options.AppendExecutionProvider_CUDA_V2(*provider);
+    }
+
+    Ort::Session session(*ort_env, MODEL_URI, options);
+    const std::array<int64_t, 2> shape{3, 2};
+    Ort::MemoryInfo memory("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault);
+    Ort::Allocator allocator(session, memory);
+    auto input = Ort::Value::CreateTensor<float>(allocator, shape.data(), shape.size());
+    auto output = Ort::Value::CreateTensor<float>(allocator, shape.data(), shape.size());
+    Ort::IoBinding binding(session);
+    binding.BindInput("X", input);
+    binding.BindOutput("Y", output);
+
+    // A different caller must establish its own current context. This also exercises
+    // teardown on a thread other than the one which allocated per-thread GPU handles.
+    auto worker = std::async(std::launch::async, [&] {
+      CUcontext initial{};
+      ASSERT_EQ(cuCtxGetCurrent(&initial), CUDA_SUCCESS);
+      ASSERT_NE(initial, owner);
+      EXPECT_THROW(session.Run(Ort::RunOptions{}, binding), Ort::Exception);
+      CUcontext current{};
+      ASSERT_EQ(cuCtxGetCurrent(&current), CUDA_SUCCESS);
+      EXPECT_EQ(current, initial);
+      ASSERT_EQ(cuCtxPushCurrent(owner), CUDA_SUCCESS);
+      {
+        auto restore = gsl::finally([&] { EXPECT_EQ(cuCtxPopCurrent(&current), CUDA_SUCCESS); });
+        for (float offset : {0.f, 1.f, 2.f, 3.f}) {
+          std::array<float, 6> data{1, 2, 3, 4, 5, 6};
+          for (float& v : data) v += offset;
+          ASSERT_EQ(cudaMemcpy(input.GetTensorMutableData<float>(), data.data(), sizeof(data), cudaMemcpyHostToDevice), cudaSuccess);
+          session.Run(Ort::RunOptions{}, binding);
+          std::array<float, 6> result{};
+          ASSERT_EQ(cudaMemcpy(result.data(), output.GetTensorData<float>(), sizeof(result), cudaMemcpyDeviceToHost), cudaSuccess);
+          for (size_t i = 0; i < result.size(); ++i) EXPECT_EQ(result[i], data[i] * static_cast<float>(i + 1));
+          ASSERT_EQ(cuCtxGetCurrent(&current), CUDA_SUCCESS);
+          EXPECT_EQ(current, owner);
+        }
+      }
+      // On this thread the graph has already been captured, so also exercise the
+      // cached replay path which bypasses the providers' OnRunStart callbacks.
+      EXPECT_THROW(session.Run(Ort::RunOptions{}, binding), Ort::Exception);
+      ASSERT_EQ(cuCtxGetCurrent(&current), CUDA_SUCCESS);
+      EXPECT_EQ(current, initial);
+    });
+    worker.get();
+  }
+
+  CUcontext current{};
+  ASSERT_EQ(cuCtxGetCurrent(&current), CUDA_SUCCESS);
+  EXPECT_EQ(current, owner);
+  // Verify that destroying the session did not destroy the caller's stream or context.
+  EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+  CUcontext popped{};
+  ASSERT_EQ(cuCtxPopCurrent(&popped), CUDA_SUCCESS);
+  EXPECT_EQ(popped, owner);
+  ASSERT_EQ(cuCtxGetCurrent(&current), CUDA_SUCCESS);
+  EXPECT_EQ(current, before);
+  // The stream is still alive and must be released with its parent context current.
+  ASSERT_EQ(cuCtxPushCurrent(owner), CUDA_SUCCESS);
+}
+
+TEST(CApiTest, CudaGraphUsesBorrowedContext) { RunWithUserCudaContext(false); }
+#ifdef USE_TENSORRT
+TEST(CApiTest, TensorRTGraphUsesBorrowedContext) { RunWithUserCudaContext(true); }
+#endif
 
 // This test uses CreateCUDAProviderOptions/UpdateCUDAProviderOptions/UpdateCUDAProviderOptionsWithValue APIs to configure and create a CUDA Execution Provider instance
 TEST(CApiTest, TestConfigureCUDAProviderOptions) {

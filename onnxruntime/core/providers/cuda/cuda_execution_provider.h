@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "core/providers/cuda/user_cuda_context.h"
 #include <set>
 #include <vector>
 
@@ -24,6 +25,9 @@ void RunOnUnload(std::function<void()> function);
 
 // Logical device representation.
 class CUDAExecutionProvider : public IExecutionProvider {
+  // Declared first so the context stays current through member destruction.
+  UserCudaContextScope cleanup_context_;
+
  public:
   explicit CUDAExecutionProvider(const CUDAExecutionProviderInfo& info);
   virtual ~CUDAExecutionProvider();
@@ -77,6 +81,7 @@ class CUDAExecutionProvider : public IExecutionProvider {
       IResourceAccountant* resource_accountant) const override;
 
   int GetDeviceId() const override { return info_.device_id; }
+  void* GetUserCudaContext() const { return info_.user_cuda_context; }
   const cudaDeviceProp& GetDeviceProp() const { return device_prop_; };
   int GetCudnnConvAlgo() const { return info_.cudnn_conv_algo_search; }
   bool DoCopyOnDefaultStream() const { return info_.do_copy_in_default_stream; }

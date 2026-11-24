@@ -5052,6 +5052,10 @@ struct OrtApi {
 
   /**
    * Update TensorRT EP provider option where its data type is pointer, for example 'user_compute_stream'.
+   * For the built-in EP, 'user_cuda_context' accepts a borrowed driver CUcontext on device_id.
+   * Make it current before appending the EP, creating, running or releasing the session and its
+   * GPU resources. Each calling thread must do this independently. An explicit compute stream must
+   * belong to the same context. Pass nullptr to use the default context selection.
    * If the data type of the provider option can be represented by string please use UpdateTensorRTProviderOptions.
    *
    * Note: It's caller's responsibility to properly manage the lifetime of the instance pointed by this pointer.
@@ -5078,6 +5082,10 @@ struct OrtApi {
 
   /**
    * Update CUDA EP provider option where its data type is pointer, for example 'user_compute_stream'.
+   * For the built-in EP, 'user_cuda_context' accepts a borrowed driver CUcontext on device_id.
+   * Make it current before appending the EP, creating, running or releasing the session and its
+   * GPU resources. Each calling thread must do this independently. An explicit compute stream must
+   * belong to the same context. Pass nullptr to use the default context selection.
    * If the data type of the provider option can be represented by string please use UpdateCUDAProviderOptions.
    *
    * Note: It's caller's responsibility to properly manage the lifetime of the instance pointed by this pointer.

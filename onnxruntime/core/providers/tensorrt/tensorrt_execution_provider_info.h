@@ -19,6 +19,7 @@ struct TensorrtExecutionProviderInfo {
   int device_id{0};
   bool has_user_compute_stream{false};
   void* user_compute_stream{nullptr};
+  void* user_cuda_context{nullptr};
   bool has_trt_options{false};
   int max_partition_iterations{1000};
   int min_subgraph_size{1};

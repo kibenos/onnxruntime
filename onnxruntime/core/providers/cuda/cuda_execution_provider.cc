@@ -19,6 +19,7 @@
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/cuda_nhwc_ops.h"
 #include "core/providers/cuda/cuda_allocator.h"
+#include "core/providers/cuda/user_cuda_context_allocator.h"
 #include "core/providers/cuda/cuda_fwd.h"
 #include "core/providers/cuda/gpu_data_transfer.h"
 #include "core/providers/cuda/cuda_profiler.h"
@@ -156,7 +157,9 @@ ONNX_OPERATOR_KERNEL_EX(
 AllocatorPtr CUDAExecutionProvider::CreateCudaAllocator(const CUDAAllocatorParams& cuda_allocator_params) {
   ORT_ENFORCE(cuda_allocator_params.external_alloc_info != nullptr,
               "CUDAAllocatorParams.external_alloc_info is nullptr.");
+  void* context = cuda_allocator_params.provider_info ? cuda_allocator_params.provider_info->user_cuda_context : nullptr;
   const auto& external_allocator_info = *(cuda_allocator_params.external_alloc_info);
+  ORT_ENFORCE(!context || !external_allocator_info.UseExternalAllocator(), "External allocators cannot be combined with user_cuda_context.");
   if (external_allocator_info.UseExternalAllocator()) {
     AllocatorCreationInfo default_memory_info(
         [external_allocator_info](OrtDevice::DeviceId id) {
@@ -172,6 +175,7 @@ AllocatorPtr CUDAExecutionProvider::CreateCudaAllocator(const CUDAAllocatorParam
   } else {
     const auto* arena_cfg = cuda_allocator_params.arena_cfg;
     const bool cuda_mempool_requested = arena_cfg != nullptr && arena_cfg->use_cuda_mempool == 1;
+    ORT_ENFORCE(!context || !cuda_mempool_requested, "A device-wide CUDA memory pool cannot be combined with user_cuda_context.");
     bool use_cuda_mempool = cuda_mempool_requested && cuda::CudaMempoolArena::IsCudaVersionSupported();
 
     if (cuda_mempool_requested && !use_cuda_mempool) {
@@ -205,8 +209,8 @@ AllocatorPtr CUDAExecutionProvider::CreateCudaAllocator(const CUDAAllocatorParam
       return mempool_allocator;
     } else {
       AllocatorCreationInfo default_memory_info(
-          [](OrtDevice::DeviceId id) {
-            return std::make_unique<CUDAAllocator>(id, CUDA);
+          [context](OrtDevice::DeviceId id) {
+            return WithUserCudaContext(std::make_unique<CUDAAllocator>(id, CUDA), context);
           },
           cuda_allocator_params.device_id,
           true,
@@ -240,7 +244,7 @@ AllocatorPtr CUDAExecutionProvider::CreateCudaPinnedAllocator(const CUDAAllocato
 
 CUDAExecutionProvider::PerThreadContext::PerThreadContext(OrtDevice::DeviceId device_id, cudaStream_t stream,
                                                           const CUDAExecutionProviderInfo& info) {
-  CUDA_CALL_THROW(cudaSetDevice(device_id));
+  CUDA_CALL_THROW(SelectProviderCudaDevice(device_id, info.user_cuda_context));
 #ifndef USE_CUDA_MINIMAL
   CUBLAS_CALL_THROW(cublasCreate(&cublas_handle_));
   CUBLAS_CALL_THROW(cublasLtCreate(&cublas_lt_handle_));
@@ -352,7 +356,8 @@ CUDAExecutionProvider::CUDAExecutionProvider(const CUDAExecutionProviderInfo& in
   ORT_ENFORCE(info_.prefer_nhwc == 0, "This build does not support NHWC layout");
 #endif
 
-  CUDA_CALL_THROW(cudaSetDevice(info_.device_id));
+  CUDA_CALL_THROW(SelectProviderCudaDevice(info_.device_id, info_.user_cuda_context));
+  CUDA_CALL_THROW(CheckUserCudaStream(info_.user_cuda_context, static_cast<cudaStream_t>(info_.user_compute_stream)));
 
   // must wait GPU idle, otherwise cudaGetDeviceProperties might fail
   CUDA_CALL_THROW(cudaDeviceSynchronize());
@@ -413,6 +418,9 @@ std::optional<bool> CUDAExecutionProvider::ShouldConvertDataLayoutForOp([[maybe_
 }
 
 CUDAExecutionProvider::~CUDAExecutionProvider() {
+  if (cleanup_context_.Enter(info_.user_cuda_context) != CUDA_SUCCESS) {
+    LOGS_DEFAULT(ERROR) << "Unable to enter user_cuda_context during provider destruction.";
+  }
   // clean up thread local context caches
   {
     std::lock_guard<std::mutex> lock(context_state_.mutex);
@@ -447,6 +455,8 @@ std::unique_ptr<profiling::EpProfiler> CUDAExecutionProvider::GetProfiler() {
 #endif
 
 CUDAExecutionProvider::PerThreadContext& CUDAExecutionProvider::GetPerThreadContext() const {
+  ORT_ENFORCE(CheckUserCudaContext(info_.user_cuda_context, info_.device_id) == cudaSuccess,
+              "The calling thread must have user_cuda_context current on the configured device.");
   const auto& per_thread_context_cache = PerThreadContextCache();
 
   // try to use cached context
@@ -3433,7 +3443,9 @@ std::unique_ptr<onnxruntime::IDataTransfer> CUDAExecutionProvider::GetDataTransf
 }
 
 std::unique_ptr<onnxruntime::IExternalDataLoader> CUDAExecutionProvider::GetExternalDataLoader() const {
-  if (info_.external_data_loader_reading_threads == 0) {
+  // The staging loader selects the primary context on its own threads. Use the
+  // regular initializer transfer path for an application-owned context.
+  if (info_.user_cuda_context || info_.external_data_loader_reading_threads == 0) {
     return nullptr;
   }
 
@@ -3716,8 +3728,8 @@ OrtDevice CUDAExecutionProvider::GetOrtDeviceByMemType(OrtMemType mem_type) cons
 
 std::vector<AllocatorPtr> CUDAExecutionProvider::CreatePreferredAllocators() {
   AllocatorCreationInfo pinned_memory_info(
-      [](OrtDevice::DeviceId device_id) {
-        return std::make_unique<CUDAPinnedAllocator>(device_id, CUDA_PINNED);
+      [context = info_.user_cuda_context](OrtDevice::DeviceId device_id) {
+        return WithUserCudaContext(std::make_unique<CUDAPinnedAllocator>(device_id, CUDA_PINNED), context);
       },
       info_.device_id);
 

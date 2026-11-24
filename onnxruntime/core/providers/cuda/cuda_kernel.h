@@ -6,6 +6,7 @@
 #ifndef BUILD_CUDA_EP_AS_PLUGIN
 
 #include "core/providers/cuda/cuda_common.h"
+#include "core/providers/cuda/user_cuda_context.h"
 #include "core/providers/cuda/cuda_execution_provider.h"
 #include "core/providers/cuda/cudnn_loader.h"
 #include "core/providers/cuda/cuda_fwd.h"
@@ -44,6 +45,10 @@ class CudaKernel : public OpKernel {
   }
 
   Status Compute(OpKernelContext* p_op_kernel_context) const override {
+    if (provider_->GetUserCudaContext()) {
+      ORT_RETURN_IF_NOT(CheckUserCudaContext(provider_->GetUserCudaContext(), provider_->GetDeviceId()) == cudaSuccess,
+                        "The CUDA kernel thread must have user_cuda_context current.");
+    }
     auto s = ComputeInternal(p_op_kernel_context);
     // use this to precisely locate the node where CUDA failure comes from
     //  if (cudaSuccess != cudaDeviceSynchronize())
