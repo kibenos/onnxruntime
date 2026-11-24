@@ -5,10 +5,12 @@
 #include "core/session/inference_session.h"
 #include "test/providers/provider_test_utils.h"
 #include "test/unittest_util/framework_test_utils.h"
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "test/util/include/default_providers.h"
 #include "test/util/include/scoped_env_vars.h"
 #include "core/providers/tensorrt/tensorrt_provider_options.h"
+#include "core/providers/tensorrt/tensorrt_execution_provider.h"
 #include "core/providers/tensorrt/tensorrt_execution_provider_utils.h"
 #include <string>
 #include <thread>
@@ -1590,11 +1592,41 @@ TEST(TensorrtExecutionProviderTest, ProfilingVerbosityInvalidValue) {
   provider_options.trt_profiling_verbosity = "verbose";
   Ort::SessionOptions session_options;
   session_options.AppendExecutionProvider_TensorRT_V2(provider_options);
-  EXPECT_THROW(Ort::Session(*ort_env, ORT_TSTR("testdata/mnist.onnx"), session_options), Ort::Exception);
+  EXPECT_THAT(
+      [&] { Ort::Session session(*ort_env, ORT_TSTR("testdata/mnist.onnx"), session_options); },
+      testing::ThrowsMessage<Ort::Exception>(testing::HasSubstr(
+          "Invalid trt_profiling_verbosity 'verbose'. Supported values: 'none', 'layer_names_only', 'detailed'.")));
+}
+
+template <typename State, typename Inspect>
+void InspectTensorRTContext(const InferenceSession& session, Inspect inspect) {
+  const auto& session_state = session.GetSessionState();
+  const Node* fused_node = nullptr;
+  for (const auto& node : session_state.GetGraphViewer().Nodes()) {
+    if (node.GetExecutionProviderType() == kTensorrtExecutionProvider) {
+      ASSERT_EQ(nullptr, fused_node);
+      fused_node = &node;
+    }
+  }
+  ASSERT_NE(nullptr, fused_node);
+
+  // The function state references the execution context owned by the provider.
+  FuncManager functions;
+  functions.SetFusedFuncs(session_state.GetFuncMgr());
+  const NodeComputeInfo* compute;
+  ASSERT_STATUS_OK(functions.GetFuncs(fused_node->Name(), compute));
+  ComputeContext compute_context{nullptr, nullptr, nullptr, fused_node->Name().c_str()};
+  FunctionState state = nullptr;
+  ASSERT_EQ(0, compute->create_state_func(&compute_context, &state));
+  const std::unique_ptr<void, const DestroyFunctionStateFunc&> owned_state{state, compute->release_state_func};
+  ASSERT_NE(nullptr, state);
+  const auto& context = *static_cast<const State*>(state)->context;
+  ASSERT_NE(nullptr, context);
+  inspect(*context);
 }
 
 TEST(TensorrtExecutionProviderTest, ProfilingVerbosityBuildAndEPContext) {
-  PathString model_name = ORT_TSTR("trt_profiling_verbosity_test.onnx");
+  const PathString model_name = ORT_TSTR("trt_profiling_verbosity_test.onnx");
   CreateBaseModel(model_name, "profiling_verbosity_test", {1, 3, 2});
   const std::string ctx_model_name = "trt_profiling_verbosity_test_ctx.onnx";
   {
@@ -1603,19 +1635,72 @@ TEST(TensorrtExecutionProviderTest, ProfilingVerbosityBuildAndEPContext) {
     provider_options.trt_dump_ep_context_model = 1;
     provider_options.trt_ep_context_embed_mode = 1;
     provider_options.trt_ep_context_file_path = ctx_model_name.c_str();
-    Ort::SessionOptions session_options;
-    session_options.AppendExecutionProvider_TensorRT_V2(provider_options);
-    Ort::Session session(*ort_env, model_name.c_str(), session_options);
+
+    InferenceSession session{SessionOptions{}, GetEnvironment()};
+    ASSERT_STATUS_OK(session.RegisterExecutionProvider(TensorrtExecutionProviderWithOptions(&provider_options)));
+    ASSERT_STATUS_OK(session.Load(model_name));
+    ASSERT_STATUS_OK(session.Initialize());
+
+    InspectTensorRTContext<TensorrtFuncState>(session, [](const auto& context) {
+      EXPECT_EQ(nvinfer1::ProfilingVerbosity::kDETAILED, context.getEngine().getProfilingVerbosity());
+    });
   }
   {
     OrtTensorRTProviderOptionsV2 provider_options;
     provider_options.trt_profiling_verbosity = "none";
-    Ort::SessionOptions session_options;
-    session_options.AppendExecutionProvider_TensorRT_V2(provider_options);
-    Ort::Session session(*ort_env, ToPathString(ctx_model_name).c_str(), session_options);
+
+    InferenceSession session{SessionOptions{}, GetEnvironment()};
+    ASSERT_STATUS_OK(session.RegisterExecutionProvider(TensorrtExecutionProviderWithOptions(&provider_options)));
+    ASSERT_STATUS_OK(session.Load(ToPathString(ctx_model_name)));
+    ASSERT_STATUS_OK(session.Initialize());
+
+    InspectTensorRTContext<TensorrtShortFuncState>(session, [](const auto& context) {
+      EXPECT_EQ(nvinfer1::ProfilingVerbosity::kDETAILED, context.getEngine().getProfilingVerbosity());
+      EXPECT_EQ(nvinfer1::ProfilingVerbosity::kNONE, context.getNvtxVerbosity());
+    });
   }
   std::filesystem::remove(model_name);
   std::filesystem::remove(ctx_model_name);
+}
+
+TEST(TensorrtExecutionProviderTest, ProfilingVerbosityDynamicShapeRebuild) {
+  const PathString model_name = ORT_TSTR("trt_profiling_verbosity_dynamic_test.onnx");
+  CreateBaseModel(model_name, "profiling_verbosity_dynamic_test", {1, -1, 2});
+
+  OrtTensorRTProviderOptionsV2 provider_options;
+  provider_options.trt_profiling_verbosity = "none";
+
+  InferenceSession session{SessionOptions{}, GetEnvironment()};
+  ASSERT_STATUS_OK(session.RegisterExecutionProvider(TensorrtExecutionProviderWithOptions(&provider_options)));
+  ASSERT_STATUS_OK(session.Load(model_name));
+  ASSERT_STATUS_OK(session.Initialize());
+
+  auto cuda_provider = DefaultCudaExecutionProvider();
+  auto cpu_allocator = cuda_provider->CreatePreferredAllocators()[1];
+  RunOptions run_options;
+  for (const int64_t rows : {3, 6}) {
+    SCOPED_TRACE(rows);
+    const std::vector<int64_t> shape{1, rows, 2};
+    const std::vector<float> values(static_cast<size_t>(rows * 2), 1.0f);
+
+    NameMLValMap feeds;
+    for (const char* name : {"X", "Y", "Z"}) {
+      OrtValue input;
+      CreateMLValue<float>(cpu_allocator, shape, values, &input);
+      feeds.emplace(name, std::move(input));
+    }
+    RunSession(session, run_options, feeds, {"M"}, shape, std::vector<float>(values.size(), 3.0f));
+
+    InspectTensorRTContext<TensorrtFuncState>(session, [&](const auto& context) {
+      const auto& engine = context.getEngine();
+      const auto profile_max = engine.getProfileShape("X", 0, nvinfer1::OptProfileSelector::kMAX);
+      ASSERT_EQ(3, profile_max.nbDims);
+      EXPECT_EQ(rows, profile_max.d[1]);
+      EXPECT_EQ(nvinfer1::ProfilingVerbosity::kNONE, engine.getProfilingVerbosity());
+    });
+  }
+
+  std::filesystem::remove(model_name);
 }
 
 }  // namespace test
