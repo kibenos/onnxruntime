@@ -6,6 +6,7 @@
 #include <memory>
 #include <utility>
 
+#include "core/providers/shared_library/provider_api.h"
 #include "core/framework/allocator.h"
 #include "core/providers/cuda/user_cuda_context.h"
 
